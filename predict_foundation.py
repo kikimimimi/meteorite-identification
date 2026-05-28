@@ -7,53 +7,8 @@ import numpy as np
 import pandas as pd
 
 from dataset import StoneDataset
-from foundation_features import build_extractor, logit, parse_views, sigmoid
-
-
-def extract_with_tta(extractor, paths, backend, batch_size, use_tta, views=None):
-    views = parse_views(views)
-    if not backend.startswith("dinov2"):
-        if views != ["full"]:
-            raise ValueError(f"--views is only supported for DINOv2 backends, got backend={backend}")
-        return extractor.encode_paths(paths, batch_size=batch_size, desc=f"Predict {backend}")
-
-    view_features = []
-    for view in views:
-        if not use_tta:
-            view_features.append(
-                extractor.encode_paths(
-                    paths,
-                    batch_size=batch_size,
-                    desc=f"Predict {backend} view={view}",
-                    transform=extractor.make_transform(view=view),
-                )
-            )
-            continue
-
-        transforms = [
-            extractor.make_transform(view=view),
-            extractor.make_transform(view=view, hflip=True),
-            extractor.make_transform(view=view, vflip=True),
-            extractor.make_transform(view=view, rotation=8),
-            extractor.make_transform(view=view, rotation=-8),
-            extractor.make_transform(view=view, brightness=1.05, contrast=1.04),
-            extractor.make_transform(view=view, brightness=0.95, contrast=0.96),
-        ]
-        features = []
-        for index, transform in enumerate(transforms, start=1):
-            features.append(
-                extractor.encode_paths(
-                    paths,
-                    batch_size=batch_size,
-                    desc=f"Predict {backend} {view} TTA {index}/{len(transforms)}",
-                    transform=transform,
-                )
-            )
-        view_features.append(np.mean(features, axis=0))
-
-    if len(view_features) == 1:
-        return view_features[0]
-    return np.concatenate(view_features, axis=1)
+from foundation_features import build_extractor, extract_with_tta, logit, parse_number_list, parse_views, sigmoid
+from submission_utils import save_threshold_submission, save_topk_submission, split_output_name
 
 
 def dataset_paths_or_fail(root):
@@ -77,42 +32,6 @@ def extract_features_for_checkpoint(extractor, backend, data_root, fusion_root, 
         print(f"Using feature fusion: {data_root} + {fusion_root} -> dim={features.shape[1]}")
 
     return ids, features
-
-
-def save_submission(template, ids, probs, threshold, output_name):
-    df = pd.DataFrame({"id": ids, "prob": probs})
-    df["label"] = (df["prob"] > threshold).astype(int)
-    submission = template[["id"]].merge(df[["id", "label"]], on="id", how="left")
-    if submission["label"].isna().any():
-        missing = submission.loc[submission["label"].isna(), "id"].head(8).tolist()
-        raise RuntimeError(f"Missing predictions for ids: {missing}")
-    submission["label"] = submission["label"].astype(int)
-    submission.to_csv(output_name, index=False)
-    print(f"Saved {output_name} | positives={int(submission['label'].sum())}/{len(submission)}")
-
-
-def save_topk_submission(template, ids, probs, topk, output_name):
-    topk = int(topk)
-    if topk <= 0 or topk > len(ids):
-        raise ValueError(f"Invalid topk={topk}; must be in [1, {len(ids)}].")
-
-    df = pd.DataFrame({"id": ids, "prob": probs})
-    df = df.sort_values("prob", ascending=False).reset_index(drop=True)
-    df["label"] = 0
-    df.loc[:topk - 1, "label"] = 1
-    submission = template[["id"]].merge(df[["id", "label"]], on="id", how="left")
-    if submission["label"].isna().any():
-        missing = submission.loc[submission["label"].isna(), "id"].head(8).tolist()
-        raise RuntimeError(f"Missing predictions for ids: {missing}")
-    submission["label"] = submission["label"].astype(int)
-    submission.to_csv(output_name, index=False)
-    print(f"Saved {output_name} | topk={topk} | positives={int(submission['label'].sum())}/{len(submission)}")
-
-
-def parse_number_list(value, cast_type=float):
-    if value is None or value == "":
-        return []
-    return [cast_type(item.strip()) for item in value.split(",") if item.strip()]
 
 
 def main():
@@ -158,7 +77,7 @@ def main():
         views=views,
     )
     probs = classifier.predict_proba(features)[:, 1]
-    save_submission(template, ids, probs, threshold, args.output)
+    save_threshold_submission(template, ids, probs, threshold, args.output)
 
     prob_df = pd.DataFrame({"id": ids, "prob": probs}).sort_values("prob", ascending=False)
     prob_df.to_csv(args.prob_output, index=False)
@@ -168,11 +87,11 @@ def main():
         f"threshold={threshold:.3f}"
     )
 
-    stem, ext = os.path.splitext(args.output)
+    stem, ext = split_output_name(args.output)
     for value in parse_number_list(args.threshold_list, float):
-        save_submission(template, ids, probs, value, f"{stem}_th{value:.2f}{ext or '.csv'}")
+        save_threshold_submission(template, ids, probs, value, f"{stem}_th{value:.2f}{ext}")
     for value in parse_number_list(args.topk_list, int):
-        save_topk_submission(template, ids, probs, value, f"{stem}_top{value}{ext or '.csv'}")
+        save_topk_submission(template, ids, probs, value, f"{stem}_top{value}{ext}")
 
     if args.guidance_gamma > 0:
         original_ids, original_paths = dataset_paths_or_fail(args.original_root)
@@ -183,7 +102,7 @@ def main():
             raise RuntimeError("--guidance-gamma is not compatible with the current fused feature shape.")
         original_probs = classifier.predict_proba(original_features)[:, 1]
         guided_probs = sigmoid(logit(probs) + args.guidance_gamma * (logit(probs) - logit(original_probs)))
-        save_submission(template, ids, guided_probs, threshold, args.guided_output)
+        save_threshold_submission(template, ids, guided_probs, threshold, args.guided_output)
 
 
 if __name__ == "__main__":

@@ -138,7 +138,85 @@ submission_samclip_multiview_th0.45.csv
 
 Use these only as controlled experiments. The validation threshold is saved in the checkpoint, but the online test distribution may differ.
 
-## 5. Optional Larger DINOv2 Model
+## 5. Feature Ensemble Route
+
+The Stage-2 recommended route remains frozen foundation features plus lightweight classifiers. Train several classifiers on the same multi-view feature cache:
+
+```bash
+python train_feature_ensemble.py \
+  --data-root processed/sam_clip_nofilter \
+  --backend dinov2 \
+  --views full,center90,center75,center60 \
+  --batch-size 16
+```
+
+This writes checkpoints and validation probabilities under:
+
+```text
+foundation_checkpoints/ensemble/
+```
+
+Optional backends:
+
+```bash
+python train_feature_ensemble.py \
+  --data-root processed/sam_clip_nofilter \
+  --backend dinov2_vitb14 \
+  --views full,center75,center60 \
+  --batch-size 8
+
+python train_feature_ensemble.py \
+  --data-root processed/sam_clip_nofilter \
+  --backend clip \
+  --views full,center75,center60 \
+  --batch-size 16
+```
+
+`dinov3` is reserved as a backend name, but it currently raises a clear error until a local model path/loading recipe is added.
+
+Generate ensemble probabilities and F1-aware submissions:
+
+```bash
+python predict_feature_ensemble.py \
+  --checkpoints "foundation_checkpoints/ensemble/dinov2_*_full-center90-center75-center60.pkl" \
+  --data-root processed/sam_clip_nofilter \
+  --detail-output ensemble_prediction_detail.csv \
+  --output submission_ensemble.csv \
+  --ensemble-method weighted \
+  --topk-list 105,108,110 \
+  --threshold-list 0.35,0.38,0.40,0.42,0.44,0.50
+```
+
+This creates files such as:
+
+```text
+submission_ensemble_top105.csv
+submission_ensemble_top108.csv
+submission_ensemble_top110.csv
+submission_ensemble_th0.40.csv
+```
+
+Every generated submission is checked against `sample_submission.csv`: exact columns, exact id order, no missing values, and 0/1 labels only.
+
+## 6. Historical Weighted Voting
+
+Use previous leaderboard submissions as weighted 0/1 voters:
+
+```bash
+python make_weighted_voting_submission.py \
+  --sample-submission processed/sam_clip_nofilter/sample_submission.csv \
+  --submissions 0.6385.csv,0.638.csv,0.635.csv \
+  --scores 0.6385,0.638,0.635 \
+  --min-score 0.60 \
+  --score-power 2 \
+  --output submission_weighted_voting.csv \
+  --topk-list 105,108,110 \
+  --threshold-list 0.40,0.45,0.50,0.55,0.60
+```
+
+This writes `weighted_voting_detail.csv` with each historical label, `weighted_vote_percent`, `vote_count`, and `rank`, plus top-k and threshold submissions.
+
+## 7. Optional Larger DINOv2 Model
 
 If GPU memory and time allow, try the larger DINOv2 base model:
 
@@ -161,7 +239,7 @@ python predict_foundation.py \
   --prob-output probs_samclip_vitb_multiview.csv
 ```
 
-## 6. CLIP Model Files
+## 8. CLIP Model Files
 
 `sam_preprocess.py --mask-ranker clip` needs a local CLIP model folder if the server cannot access Hugging Face.
 
@@ -192,7 +270,7 @@ Then pass:
 
 Do not pass only `model.safetensors`; `transformers` needs the full folder.
 
-## 7. Recommended Submission Order
+## 9. Recommended Submission Order
 
 Try these first:
 
@@ -222,4 +300,3 @@ python train_foundation.py \
   --views full,center75,center60 \
   --batch-size 16
 ```
-

@@ -10,6 +10,7 @@ from tqdm import tqdm
 
 from dataset import StoneDataset
 from model import get_model
+from submission_utils import save_threshold_submission, save_topk_submission as save_topk_submission_file
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -81,25 +82,11 @@ def predict_with_transform(model, transform, data_root, batch_size):
 
 
 def save_submission(template, ids, probs, threshold, output_name):
-    result = pd.DataFrame({"id": ids, "prob": probs})
-    result["label"] = (result["prob"] > threshold).astype(int)
-    submission = template[["id"]].merge(result[["id", "label"]], on="id", how="left")
-    if submission["label"].isna().any():
-        missing = submission.loc[submission["label"].isna(), "id"].head(8).tolist()
-        raise RuntimeError(f"Missing predictions for ids: {missing}")
-    submission["label"] = submission["label"].astype(int)
-    submission.to_csv(output_name, index=False)
-    print(f"Saved {output_name} | positives={int(submission['label'].sum())}/{len(submission)}")
+    save_threshold_submission(template, ids, probs, threshold, output_name)
 
 
 def save_topk_submission(template, ids, probs, topk, output_name):
-    df = pd.DataFrame({"id": ids, "prob": probs}).sort_values("prob", ascending=False).reset_index(drop=True)
-    df["label"] = 0
-    df.loc[:topk - 1, "label"] = 1
-    submission = template[["id"]].merge(df[["id", "label"]], on="id", how="left")
-    submission["label"] = submission["label"].astype(int)
-    submission.to_csv(output_name, index=False)
-    print(f"Saved {output_name} | topk={topk} | positives={int(submission['label'].sum())}/{len(submission)}")
+    save_topk_submission_file(template, ids, probs, topk, output_name)
 
 
 def main():

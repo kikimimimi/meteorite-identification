@@ -39,6 +39,12 @@ def parse_views(value):
     return views or ["full"]
 
 
+def parse_number_list(value, cast_type=float):
+    if value is None or value == "":
+        return []
+    return [cast_type(item.strip()) for item in str(value).split(",") if item.strip()]
+
+
 class RelativeSquareCrop:
     def __init__(self, scale=1.0, position="center"):
         self.scale = float(scale)
@@ -90,7 +96,15 @@ def view_to_crop(view):
         except ValueError as exc:
             raise ValueError(f"Invalid view: {view}") from exc
 
-    raise ValueError(f"Unknown DINOv2 view: {view}")
+    raise ValueError(f"Unknown feature view: {view}")
+
+
+def apply_view(image, view="full"):
+    crop = view_to_crop(view)
+    if crop is None:
+        return image
+    scale, position = crop
+    return RelativeSquareCrop(scale=scale, position=position)(image)
 
 
 class ImagePathDataset(Dataset):
@@ -202,12 +216,38 @@ class ClipExtractor:
         self.model = CLIPModel.from_pretrained(model_name).to(DEVICE)
         self.model.eval()
 
+    def make_transform(
+        self,
+        hflip=False,
+        vflip=False,
+        rotation=0,
+        brightness=1.0,
+        contrast=1.0,
+        view="full",
+    ):
+        ops = []
+        crop = view_to_crop(view)
+        if crop is not None:
+            scale, position = crop
+            ops.append(RelativeSquareCrop(scale=scale, position=position))
+        if hflip:
+            ops.append(transforms.RandomHorizontalFlip(p=1.0))
+        if vflip:
+            ops.append(transforms.RandomVerticalFlip(p=1.0))
+        if rotation != 0:
+            ops.append(transforms.RandomRotation((rotation, rotation), fill=255))
+        if brightness != 1.0 or contrast != 1.0:
+            ops.append(transforms.ColorJitter(brightness=(brightness, brightness), contrast=(contrast, contrast)))
+        return transforms.Compose(ops) if ops else None
+
     @torch.no_grad()
     def encode_paths(self, paths, batch_size=16, num_workers=0, desc="CLIP", transform=None):
         all_features = []
         for start in tqdm(range(0, len(paths), batch_size), desc=desc):
             batch_paths = paths[start:start + batch_size]
             images = [Image.open(path).convert("RGB") for path in batch_paths]
+            if transform is not None:
+                images = [transform(image) for image in images]
             inputs = self.processor(images=images, return_tensors="pt")
             inputs = {key: value.to(DEVICE) for key, value in inputs.items()}
             features = self.model.get_image_features(**inputs)
@@ -215,11 +255,110 @@ class ClipExtractor:
             all_features.append(features.detach().cpu().float().numpy())
         return np.concatenate(all_features, axis=0)
 
+    def encode_paths_views(self, paths, views=None, batch_size=16, num_workers=0, desc="CLIP"):
+        views = parse_views(views)
+        all_features = []
+        for view in views:
+            all_features.append(
+                self.encode_paths(
+                    paths,
+                    batch_size=batch_size,
+                    desc=f"{desc} view={view}",
+                    transform=self.make_transform(view=view),
+                )
+            )
+        if len(all_features) == 1:
+            return all_features[0]
+        return np.concatenate(all_features, axis=1)
+
 
 def build_extractor(backend):
+    if backend == "dinov3" or backend.startswith("dinov3"):
+        raise NotImplementedError(
+            "DINOv3 backend is reserved but not wired yet. "
+            "Please provide a local model path/loading recipe before using --backend dinov3."
+        )
     if backend.startswith("dinov2"):
         model_name = backend if backend != "dinov2" else "dinov2_vits14"
         return DinoV2Extractor(model_name=model_name)
     if backend == "clip":
         return ClipExtractor()
     raise ValueError(f"Unknown feature backend: {backend}")
+
+
+def load_or_extract_features(paths, backend, cache_dir, batch_size, prefix="train", views=None, num_workers=2):
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    views = parse_views(views)
+    cache_backend = f"{backend}_views-{'-'.join(views)}"
+    cache_path = cache_dir / stable_cache_name(prefix, paths, cache_backend)
+    if cache_path.exists():
+        data = np.load(cache_path, allow_pickle=True)
+        return data["features"]
+
+    extractor = build_extractor(backend)
+    if hasattr(extractor, "encode_paths_views"):
+        features = extractor.encode_paths_views(
+            paths,
+            views=views,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            desc=f"Extract {prefix} {backend}",
+        )
+    elif views != ["full"]:
+        raise ValueError(f"--views is not supported for backend={backend}")
+    else:
+        features = extractor.encode_paths(
+            paths,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            desc=f"Extract {prefix} {backend}",
+        )
+    np.savez_compressed(cache_path, features=features, paths=np.array([str(path) for path in paths]))
+    print(f"Cached features: {cache_path}")
+    return features
+
+
+def extract_with_tta(extractor, paths, backend, batch_size, use_tta=False, views=None, num_workers=2, desc_prefix="Predict"):
+    views = parse_views(views)
+    view_features = []
+    for view in views:
+        if not use_tta:
+            view_features.append(
+                extractor.encode_paths(
+                    paths,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    desc=f"{desc_prefix} {backend} view={view}",
+                    transform=extractor.make_transform(view=view) if hasattr(extractor, "make_transform") else None,
+                )
+            )
+            continue
+
+        if not hasattr(extractor, "make_transform"):
+            raise ValueError(f"TTA is not supported for backend={backend}")
+        transforms_for_tta = [
+            extractor.make_transform(view=view),
+            extractor.make_transform(view=view, hflip=True),
+            extractor.make_transform(view=view, vflip=True),
+            extractor.make_transform(view=view, rotation=8),
+            extractor.make_transform(view=view, rotation=-8),
+            extractor.make_transform(view=view, brightness=1.05, contrast=1.04),
+            extractor.make_transform(view=view, brightness=0.95, contrast=0.96),
+        ]
+        features = []
+        for index, transform in enumerate(transforms_for_tta, start=1):
+            features.append(
+                extractor.encode_paths(
+                    paths,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    desc=f"{desc_prefix} {backend} {view} TTA {index}/{len(transforms_for_tta)}",
+                    transform=transform,
+                )
+            )
+        view_features.append(np.mean(features, axis=0))
+
+    if len(view_features) == 1:
+        return view_features[0]
+    return np.concatenate(view_features, axis=1)

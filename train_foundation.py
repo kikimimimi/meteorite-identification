@@ -11,7 +11,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 from dataset import StoneDataset
-from foundation_features import build_extractor, parse_views, stable_cache_name
+from foundation_features import load_or_extract_features, parse_views
 
 
 def find_best_threshold(labels, probs):
@@ -27,33 +27,6 @@ def find_best_threshold(labels, probs):
 
 def normalize_rows(x, eps=1e-8):
     return x / (np.linalg.norm(x, axis=1, keepdims=True) + eps)
-
-
-def load_or_extract_features(paths, backend, cache_dir, batch_size, prefix="train", views=None):
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    views = parse_views(views)
-    cache_backend = f"{backend}_views-{'-'.join(views)}"
-    cache_path = cache_dir / stable_cache_name(prefix, paths, cache_backend)
-    if cache_path.exists():
-        data = np.load(cache_path, allow_pickle=True)
-        return data["features"]
-
-    extractor = build_extractor(backend)
-    if hasattr(extractor, "encode_paths_views"):
-        features = extractor.encode_paths_views(
-            paths,
-            views=views,
-            batch_size=batch_size,
-            desc=f"Extract train {backend}",
-        )
-    elif views != ["full"]:
-        raise ValueError(f"--views is only supported for DINOv2 backends, got backend={backend}")
-    else:
-        features = extractor.encode_paths(paths, batch_size=batch_size, desc=f"Extract train {backend}")
-    np.savez_compressed(cache_path, features=features, paths=np.array([str(path) for path in paths]))
-    print(f"Cached features: {cache_path}")
-    return features
 
 
 def load_train_dataset(root):
