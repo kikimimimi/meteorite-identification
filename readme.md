@@ -216,7 +216,164 @@ python make_weighted_voting_submission.py \
 
 This writes `weighted_voting_detail.csv` with each historical label, `weighted_vote_percent`, `vote_count`, and `rank`, plus top-k and threshold submissions.
 
-## 7. Optional Larger DINOv2 Model
+## 7. Label Propagation With Stage-1 Unlabeled Test
+
+If train/test distribution shift is strong, use DINOv2 features to build a kNN graph over labeled train images, current test images, and optional stage-1 unlabeled test images:
+
+```bash
+python label_propagation.py \
+  --data-root processed/sam_clip_nofilter \
+  --stage1-unlabeled-root test_images_stage1 \
+  --backend dinov2 \
+  --views full,center75,center60 \
+  --n-neighbors 15 \
+  --alpha 0.2 \
+  --batch-size 16 \
+  --output submission_label_propagation.csv \
+  --detail-output label_propagation_detail.csv \
+  --topk-list 90,100,105,108,110,120 \
+  --threshold-list 0.35,0.38,0.40,0.42,0.44,0.50
+```
+
+Blend label propagation with an existing model ensemble detail file:
+
+```bash
+python label_propagation.py \
+  --data-root processed/sam_clip_nofilter \
+  --stage1-unlabeled-root test_images_stage1 \
+  --backend dinov2 \
+  --views full,center75,center60 \
+  --external-prob-file ensemble_prediction_detail.csv \
+  --external-prob-col weighted_prob \
+  --lp-weight 0.45 \
+  --output submission_lp_blend.csv \
+  --detail-output label_propagation_blend_detail.csv \
+  --topk-list 90,100,105,108,110,120
+```
+
+Use `--no-stage1` to test whether stage-1 unlabeled images help or hurt.
+
+## 8. INR Descriptor Branch
+
+The `INR` branch adds a lightweight idea inspired by *Fit Pixels, Get Labels*: fit a small SIREN/INR to each image's pixels and use the fitting dynamics plus hidden statistics as extra descriptors. The current implementation does not require segmentation masks and does not replace DINOv2; it concatenates INR descriptors with frozen foundation features.
+
+Train a DINOv2 + INR classifier:
+
+```bash
+python train_inr_classifier.py \
+  --data-root processed/sam_clip_nofilter \
+  --foundation-backend dinov2 \
+  --foundation-views full,center75,center60 \
+  --classifier logreg \
+  --inr-image-size 48 \
+  --inr-steps 80 \
+  --inr-pixels-per-step 1024 \
+  --batch-size 16
+```
+
+Predict and generate top-k submissions:
+
+```bash
+python predict_inr_classifier.py \
+  --checkpoint foundation_checkpoints/inr/dinov2_full-center75-center60_plus_inr_logreg.pkl \
+  --data-root processed/sam_clip_nofilter \
+  --detail-output inr_prediction_detail.csv \
+  --output submission_inr.csv \
+  --topk-list 90,100,105,108,110,120 \
+  --threshold-list 0.35,0.38,0.40,0.42,0.44,0.50
+```
+
+Blend INR probabilities with an existing ensemble detail file:
+
+```bash
+python predict_inr_classifier.py \
+  --checkpoint foundation_checkpoints/inr/dinov2_full-center75-center60_plus_inr_logreg.pkl \
+  --data-root processed/sam_clip_nofilter \
+  --external-prob-file ensemble_prediction_detail.csv \
+  --external-prob-col weighted_prob \
+  --inr-weight 0.25 \
+  --detail-output inr_blend_prediction_detail.csv \
+  --output submission_inr_blend.csv \
+  --topk-list 90,100,105,108,110,120
+```
+
+For a faster sanity check, reduce `--inr-steps` to `30`. For stronger descriptors, try `--inr-image-size 64 --inr-steps 120`, but it will be slower.
+
+## 9. Nearest-Neighbor And Boundary Inspection
+
+When top-k is already near the best positive count, use feature-space retrieval to find ranking errors and possible near-duplicates:
+
+```bash
+python nearest_neighbor_analysis.py \
+  --data-root processed/sam_clip_nofilter \
+  --backend dinov2_vitb14 \
+  --views full,center90,center80,center75,center70,center60 \
+  --batch-size 8 \
+  --vote-k 7 \
+  --sim-power 4 \
+  --external-prob-file ensemble_vitb_multicenter_detail.csv \
+  --external-prob-col weighted_prob \
+  --external-weight 0.70 \
+  --detail-output nearest_neighbor_vitb_detail.csv \
+  --output submission_nearest_neighbor_vitb.csv \
+  --topk-list 105
+```
+
+This writes nearest train neighbors, train labels, cosine similarities, optional stage-1 nearest neighbors, and a kNN-derived score.
+
+Export rank-boundary images for manual review:
+
+```bash
+python export_rank_images.py \
+  --detail-file ensemble_vitb_multicenter_detail.csv \
+  --data-root processed/sam_clip_nofilter \
+  --output-dir inspect_vitb_rank_80_130 \
+  --rank-column rank \
+  --score-column weighted_prob \
+  --rank-from 80 \
+  --rank-to 130
+```
+
+The most useful manual review region is usually around the chosen top-k boundary, for example rank 80-130 when submitting top105.
+
+## 10. Original + SAM-Crop Two-Branch Blend
+
+Train and predict the original-image branch with the same strong `dinov2_vitb14` multi-center setup:
+
+```bash
+python train_feature_ensemble.py \
+  --data-root . \
+  --backend dinov2_vitb14 \
+  --views full,center90,center80,center75,center70,center60 \
+  --batch-size 8 \
+  --output-dir foundation_checkpoints/ensemble_original
+
+python predict_feature_ensemble.py \
+  --checkpoints "foundation_checkpoints/ensemble_original/dinov2_vitb14_*_full-center90-center80-center75-center70-center60.pkl" \
+  --data-root . \
+  --detail-output ensemble_original_vitb_multicenter_detail.csv \
+  --output submission_original_vitb_multicenter.csv \
+  --ensemble-method weighted \
+  --topk-list 105
+```
+
+Blend the original-image branch with the SAM/CLIP crop branch:
+
+```bash
+python blend_prediction_details.py \
+  --sample-submission processed/sam_clip_nofilter/sample_submission.csv \
+  --detail-files ensemble_vitb_multicenter_detail.csv,ensemble_original_vitb_multicenter_detail.csv \
+  --score-cols weighted_prob,weighted_prob \
+  --weights 0.65,0.35 \
+  --aliases samcrop,original \
+  --detail-output ensemble_sam_original_blend_detail.csv \
+  --output submission_sam_original_blend.csv \
+  --topk-list 105
+```
+
+If the original branch is strong, also try `--weights 0.50,0.50`. If it is weaker but complementary, keep the original branch at `0.20-0.35`.
+
+## 11. Optional Larger DINOv2 Model
 
 If GPU memory and time allow, try the larger DINOv2 base model:
 
@@ -239,7 +396,7 @@ python predict_foundation.py \
   --prob-output probs_samclip_vitb_multiview.csv
 ```
 
-## 8. CLIP Model Files
+## 12. CLIP Model Files
 
 `sam_preprocess.py --mask-ranker clip` needs a local CLIP model folder if the server cannot access Hugging Face.
 
@@ -270,7 +427,7 @@ Then pass:
 
 Do not pass only `model.safetensors`; `transformers` needs the full folder.
 
-## 9. Recommended Submission Order
+## 13. Recommended Submission Order
 
 Try these first:
 
