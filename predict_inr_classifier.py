@@ -9,6 +9,7 @@ import pandas as pd
 from dataset import StoneDataset
 from foundation_features import load_or_extract_features, parse_number_list, parse_views
 from inr_features import extract_inr_features
+from meta_inr import transform_meta_inr_features
 from submission_utils import save_threshold_submission, save_topk_submission, split_output_name
 
 
@@ -55,6 +56,12 @@ def build_feature_matrix(checkpoint, paths, cache_dir, batch_size):
         seed=inr_config["seed"],
     )
     matrices = [inr_features]
+    if checkpoint.get("use_meta_inr", False):
+        meta_checkpoint = checkpoint.get("meta_inr_checkpoint")
+        if meta_checkpoint is None:
+            raise RuntimeError("Checkpoint uses Meta-INR but does not contain meta_inr_checkpoint.")
+        meta_features = transform_meta_inr_features(meta_checkpoint, inr_features)
+        matrices.append(meta_features)
     if not checkpoint.get("no_foundation", False):
         backend = checkpoint["foundation_backend"]
         views = parse_views(checkpoint.get("foundation_views", "full"))

@@ -2,72 +2,105 @@
 
 ## Current Best Route
 
-As of 2026-05-30, the methods that are actually working are:
+As of 2026-05-31, the strongest working route is:
 
 ```text
 original images
-+ DINOv2 ViT-B/14 frozen features
-+ multi-center views
-+ lightweight feature ensemble
-+ strong INR descriptor re-ranking
-+ top105 submission
++ DINOv2 ViT-B/14
++ LoRA / PEFT fine-tuning on the meteorite labels
++ CLS + patch-token mean pooling
++ strong geometric/color augmentation
++ flip TTA at inference
++ top106 submission
 ```
 
 The strongest recorded public score is approximately:
 
 ```text
-0.764
+0.80208
 ```
 
 from:
 
 ```text
-submission_original_inr_strong_w040_top105.csv
+submission_dinov2_lora_quick_top106.csv
 ```
 
 The current best command pattern is:
 
 ```bash
-python train_feature_ensemble.py \
+python train_dinov2_lora.py \
   --data-root . \
-  --backend dinov2_vitb14 \
-  --views full,center90,center80,center75,center70,center60 \
-  --batch-size 8 \
-  --output-dir foundation_checkpoints/ensemble_original
-
-python predict_feature_ensemble.py \
-  --checkpoints "foundation_checkpoints/ensemble_original/dinov2_vitb14_*_full-center90-center80-center75-center70-center60.pkl" \
-  --data-root . \
-  --detail-output ensemble_original_vitb_multicenter_detail.csv \
-  --output submission_original_vitb_multicenter.csv \
-  --ensemble-method weighted \
-  --topk-list 105
-
-python train_inr_classifier.py \
-  --data-root . \
-  --foundation-backend dinov2_vitb14 \
-  --foundation-views full,center90,center80,center75,center70,center60 \
-  --classifier logreg \
-  --inr-image-size 64 \
-  --inr-steps 160 \
-  --inr-pixels-per-step 2048 \
-  --inr-hidden-dim 64 \
-  --inr-hidden-layers 3 \
-  --batch-size 8 \
-  --output-dir foundation_checkpoints/inr_strong
-
-python predict_inr_classifier.py \
-  --checkpoint foundation_checkpoints/inr_strong/dinov2_vitb14_full-center90-center80-center75-center70-center60_plus_inr_logreg.pkl \
-  --data-root . \
-  --external-prob-file ensemble_original_vitb_multicenter_detail.csv \
-  --external-prob-col weighted_prob \
-  --inr-weight 0.40 \
-  --detail-output original_inr_strong_w040_detail.csv \
-  --output submission_original_inr_strong_w040.csv \
-  --topk-list 105
+  --model-name dinov2_vitb14 \
+  --image-size 518 \
+  --pool cls_mean \
+  --folds 1 \
+  --seed 42 \
+  --batch-size 4 \
+  --epochs 18 \
+  --patience 5 \
+  --lr 0.0002 \
+  --weight-decay 0.0002 \
+  --amp \
+  --lora-rank 8 \
+  --lora-alpha 16 \
+  --lora-last-n-blocks 4 \
+  --tta flip \
+  --detail-output dinov2_lora_quick_detail.csv \
+  --fold-output dinov2_lora_quick_folds.csv \
+  --output submission_dinov2_lora_quick.csv \
+  --topk-list 103,104,105,106,107
 ```
 
 ## What Worked
+
+### 0. DINOv2 LoRA / PEFT Fine-Tuning Is the New Best Method
+
+The biggest algorithmic improvement came from adapting DINOv2 to the meteorite domain with LoRA instead of using DINOv2 only as a frozen feature extractor.
+
+Recorded public scores:
+
+```text
+original images + frozen dinov2_vitb14 multicenter top105: ~0.74
+frozen dinov2_vitb14 + strong INR top105: 0.76439
+DINOv2 LoRA quick top105: 0.79581
+DINOv2 LoRA quick top106: 0.80208
+```
+
+Interpretation:
+
+```text
+Frozen DINOv2 already provides a strong visual prior.
+LoRA gives the model a small number of trainable parameters to adapt to meteorite-specific surface, shape, and texture cues.
+This corrected about four additional top-k positives compared with the strong INR route.
+```
+
+The LoRA model uses:
+
+```text
+backbone = dinov2_vitb14
+image_size = 518
+pooling = CLS token + patch-token mean
+trainable layers = LoRA adapters in the last 4 ViT blocks
+classification head = lightweight binary linear head
+augmentation = resized crop, flips, rotation, color jitter
+inference = flip TTA
+```
+
+Why it helped:
+
+```text
+The frozen feature route can only separate images using generic pretrained features.
+LoRA performs parameter-efficient domain adaptation, so DINOv2 keeps its general visual representation but shifts its high-level features toward the competition's meteorite/non-meteorite boundary.
+Patch-token mean pooling also exposes local texture information, which is likely important for meteorite surfaces.
+```
+
+Current recommendation:
+
+```text
+Use DINOv2 LoRA top106 as the best submission route.
+Keep the frozen DINOv2 + INR route as an interpretable baseline and backup.
+```
 
 ### 1. Original Images Beat SAM-Cropped Images
 
@@ -133,6 +166,7 @@ Recorded public scores:
 ```text
 original images + dinov2_vitb14 multicenter top105: ~0.74
 same baseline + strong INR w0.40 top105: ~0.764
+DINOv2 LoRA quick top106: 0.80208
 ```
 
 Interpretation:
@@ -140,6 +174,7 @@ Interpretation:
 ```text
 INR is not the primary classifier.
 INR is useful for re-ranking boundary samples near top105.
+After LoRA fine-tuning, INR is no longer the current best route, but it remains useful evidence that low-level texture/reconstruction cues matter.
 ```
 
 The INR contributes image-fitting descriptors such as:
@@ -269,26 +304,48 @@ If the top105 set changes by only a few samples, it is a low-risk candidate. If 
 
 ## Current Working Hypothesis
 
-The best current model is not solving the task by pure semantic classification alone. It benefits from two complementary signals:
+The best current model is not solving the task by pure semantic classification alone. The experiments suggest a progression:
 
 ```text
-DINOv2 ViT-B/14:
-  strong visual representation, object shape, context, global semantics
+Frozen DINOv2 ViT-B/14:
+  strong generic visual representation, object shape, context, global semantics
 
 INR:
   texture, reconstruction dynamics, residual patterns, surface complexity
+
+DINOv2 LoRA:
+  parameter-efficient domain adaptation that moves the pretrained representation toward the meteorite/non-meteorite decision boundary
 ```
 
-The likely path from `0.764` toward `0.80+` is:
+The successful path from `0.764` to `0.80208` was:
 
 ```text
-1. Keep original-image dinov2_vitb14 multi-center as the base.
-2. Improve INR descriptor strength and boundary reranking.
-3. Manually inspect rank 80-130 changed samples.
-4. Avoid adding LP unless a future variant proves useful.
+1. Keep original images instead of SAM-cropped images.
+2. Use DINOv2 ViT-B/14 as the visual foundation model.
+3. Move from frozen features to LoRA/PEFT fine-tuning.
+4. Preserve local information with CLS + patch-token mean pooling.
+5. Use top-k calibration around 105-107, with best current top106.
 ```
 
 ## References And Literature Support
+
+### DINOv2 And Parameter-Efficient Adaptation
+
+Oquab et al., **DINOv2: Learning Robust Visual Features without Supervision**, 2023.
+
+DINOv2 provides the visual foundation used throughout the project. Our results support the paper's core claim that self-supervised ViT features are strong general-purpose representations, and the LoRA branch shows that those features can be further adapted to the meteorite domain.
+
+Link:
+
+- https://arxiv.org/abs/2304.07193
+
+Hu et al., **LoRA: Low-Rank Adaptation of Large Language Models**, 2021.
+
+LoRA was introduced for language models, but the same low-rank-adapter idea is now widely used for vision transformers. Our DINOv2 LoRA branch freezes the pretrained backbone and trains small low-rank updates in selected Linear layers, giving a strong accuracy gain without full fine-tuning.
+
+Link:
+
+- https://arxiv.org/abs/2106.09685
 
 The current INR branch is not copied directly from one paper. It is a practical hybrid:
 

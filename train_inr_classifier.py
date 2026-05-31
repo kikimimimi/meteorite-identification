@@ -17,6 +17,7 @@ from sklearn.svm import LinearSVC
 from dataset import StoneDataset
 from foundation_features import load_or_extract_features, parse_views
 from inr_features import extract_inr_features
+from meta_inr import meta_feature_names, train_meta_inr_encoder, transform_meta_inr_features
 
 
 def find_best_threshold(labels, probs):
@@ -94,7 +95,7 @@ def build_feature_matrix(args, paths):
 
     features = np.concatenate(matrices, axis=1).astype(np.float32)
     print(f"Feature matrix: {' + '.join(feature_parts)} -> dim={features.shape[1]}")
-    return features, inr_names
+    return features, inr_features, inr_names
 
 
 def main():
@@ -116,11 +117,21 @@ def main():
     parser.add_argument("--inr-hidden-layers", type=int, default=2)
     parser.add_argument("--inr-omega-0", type=float, default=30.0)
     parser.add_argument("--inr-lr", type=float, default=1e-3)
+    parser.add_argument("--use-meta-inr", action="store_true", help="Learn a nonlinear meta encoder from INR descriptors.")
+    parser.add_argument("--meta-hidden-dim", type=int, default=256)
+    parser.add_argument("--meta-embedding-dim", type=int, default=64)
+    parser.add_argument("--meta-epochs", type=int, default=250)
+    parser.add_argument("--meta-batch-size", type=int, default=64)
+    parser.add_argument("--meta-lr", type=float, default=1e-3)
+    parser.add_argument("--meta-weight-decay", type=float, default=1e-4)
+    parser.add_argument("--meta-recon-weight", type=float, default=0.05)
+    parser.add_argument("--meta-dropout", type=float, default=0.1)
+    parser.add_argument("--meta-patience", type=int, default=35)
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     ids, labels, paths = load_train_dataset(args.data_root)
-    features, inr_names = build_feature_matrix(args, paths)
+    features, inr_features, inr_names = build_feature_matrix(args, paths)
 
     indices = np.arange(len(labels))
     train_idx, val_idx = train_test_split(
@@ -129,6 +140,33 @@ def main():
         stratify=labels,
         random_state=args.seed,
     )
+    meta_checkpoint = None
+    meta_names = []
+    if args.use_meta_inr:
+        meta_config = {
+            "hidden_dim": args.meta_hidden_dim,
+            "embedding_dim": args.meta_embedding_dim,
+            "epochs": args.meta_epochs,
+            "batch_size": args.meta_batch_size,
+            "lr": args.meta_lr,
+            "weight_decay": args.meta_weight_decay,
+            "recon_weight": args.meta_recon_weight,
+            "dropout": args.meta_dropout,
+            "patience": args.meta_patience,
+        }
+        meta_checkpoint = train_meta_inr_encoder(
+            inr_features[train_idx],
+            labels[train_idx],
+            inr_features[val_idx],
+            labels[val_idx],
+            meta_config,
+            seed=args.seed,
+        )
+        meta_features = transform_meta_inr_features(meta_checkpoint, inr_features)
+        meta_names = meta_feature_names(args.meta_embedding_dim)
+        features = np.concatenate([features, meta_features], axis=1).astype(np.float32)
+        print(f"Added Meta-INR features: dim={meta_features.shape[1]} -> total_dim={features.shape[1]}")
+
     x_train, y_train = features[train_idx], labels[train_idx]
     x_val, y_val = features[val_idx], labels[val_idx]
 
@@ -144,6 +182,8 @@ def main():
 
     foundation_views = parse_views(args.foundation_views)
     feature_tag = "inr_only" if args.no_foundation else f"{args.foundation_backend}_{'-'.join(foundation_views)}_plus_inr"
+    if args.use_meta_inr:
+        feature_tag = f"{feature_tag}_meta"
     checkpoint_path = Path(args.output_dir) / f"{feature_tag}_{args.classifier}.pkl"
     checkpoint = {
         "classifier": classifier,
@@ -155,6 +195,9 @@ def main():
         "no_foundation": bool(args.no_foundation),
         "foundation_backend": args.foundation_backend,
         "foundation_views": foundation_views,
+        "use_meta_inr": bool(args.use_meta_inr),
+        "meta_inr_checkpoint": meta_checkpoint,
+        "meta_inr_feature_names": meta_names,
         "inr_config": {
             "image_size": args.inr_image_size,
             "steps": args.inr_steps,
