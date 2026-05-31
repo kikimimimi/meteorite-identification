@@ -17,11 +17,16 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
 from dataset import StoneDataset
-from foundation_features import parse_number_list
 from submission_utils import save_topk_submission, split_output_name
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def parse_number_list(value, cast_type=float):
+    if value is None or value == "":
+        return []
+    return [cast_type(item.strip()) for item in str(value).split(",") if item.strip()]
 
 
 def set_seed(seed):
